@@ -5,12 +5,16 @@ import {
   Activity,
   ArrowDownToLine,
   BadgeCheck,
+  BarChart3,
   Database,
-  Map,
+  Layers3,
+  Map as MapIcon,
   MapPin,
   Search,
+  ShieldCheck,
   Store,
   Table2,
+  TrendingUp,
   UsersRound,
   Waypoints
 } from "lucide-react";
@@ -61,6 +65,8 @@ type ThanaResponse = {
   rows: ThanaProfile[];
 };
 
+type AtlasMetric = "density" | "priority" | "market" | "sector";
+
 const formatter = new Intl.NumberFormat("en-US");
 const compactFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
@@ -77,6 +83,13 @@ const heroCities = [
   { name: "Khulna", lon: 89.5403, lat: 22.8456 },
   { name: "Rajshahi", lon: 88.6241, lat: 24.3636 },
   { name: "Sylhet", lon: 91.8687, lat: 24.8949 }
+];
+
+const atlasMetricOptions: Array<{ id: AtlasMetric; label: string }> = [
+  { id: "density", label: "Density" },
+  { id: "priority", label: "FMCG priority" },
+  { id: "market", label: "Market class" },
+  { id: "sector", label: "Sector" }
 ];
 
 function formatNumber(value: number) {
@@ -99,6 +112,65 @@ function csvEscape(value: unknown) {
 function formatProfileNumber(value: unknown, suffix = "") {
   const number = toNumber(value);
   return number ? `${formatNumber(number)}${suffix}` : "n/a";
+}
+
+function normalizeClientName(value: unknown) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\b(upazila|upazilla|thana|sadar|city|metro|metropolitan|police|i c|u p o)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function percentOf(value: number, total: number) {
+  if (!total) return 0;
+  return Math.round((value / total) * 1000) / 10;
+}
+
+function countProfiles(rows: ThanaProfile[], key: keyof ThanaProfile) {
+  const counts = new Map<string, number>();
+  rows.forEach((row) => {
+    const name = String(row[key] || "Unknown");
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  });
+  return [...counts.entries()]
+    .map(([name, count]) => ({ name, count, pct: percentOf(count, rows.length) }))
+    .sort((a, b) => b.count - a.count);
+}
+
+function atlasFill(profile: ThanaProfile | undefined, metric: AtlasMetric, maxDensity: number) {
+  if (!profile) return "#d8cfbb";
+  if (metric === "priority") {
+    if (profile.distributionPriority === "A") return "#0b7f59";
+    if (profile.distributionPriority === "B") return "#c9952b";
+    return "#8e9a91";
+  }
+  if (metric === "market") {
+    if (profile.marketClassification === "Urban") return "#e23b4e";
+    if (profile.marketClassification === "Semi-Urban") return "#c9952b";
+    return "#2f7e69";
+  }
+  if (metric === "sector") {
+    if (profile.primarySector === "Services") return "#356dc8";
+    if (profile.primarySector === "Industry") return "#a35a2a";
+    return "#0b7f59";
+  }
+  const density = toNumber(profile.densityPerSqKm);
+  const ratio = Math.max(0.08, Math.min(1, density / (maxDensity || 1)));
+  if (ratio > 0.74) return "#e23b4e";
+  if (ratio > 0.46) return "#d18b2c";
+  if (ratio > 0.22) return "#5fae8c";
+  return "#b7cdbd";
+}
+
+function profileLabel(profile: ThanaProfile | undefined, metric: AtlasMetric) {
+  if (!profile) return "No joined profile";
+  if (metric === "density") return `${formatProfileNumber(profile.densityPerSqKm, " /km2")} density`;
+  if (metric === "priority") return `Priority ${profile.distributionPriority || "n/a"}`;
+  if (metric === "market") return profile.marketClassification || "Unclassified";
+  return profile.primarySector || "Unknown sector";
 }
 
 function downloadRows(dataset: DatasetDefinition | null, rows: DataRow[]) {
@@ -282,7 +354,7 @@ function DataMap({ layerId }: { layerId: string }) {
     <div className={`map-canvas ${layerId}`}>
       {loading ? <div className="loading">Loading map layer...</div> : content}
       <div className="map-meta">
-        <Map size={16} />
+        <MapIcon size={16} />
         <span>{geo?.dataset.label ?? "Map layer"} · {formatNumber(geo?.geojson.features?.length ?? 0)} features</span>
       </div>
     </div>
@@ -497,7 +569,7 @@ function TerritoryFinder() {
                 <span>Population</span>
               </div>
               <div>
-                <Map size={18} />
+                <MapIcon size={18} />
                 <strong>{formatProfileNumber(activeProfile.densityPerSqKm, " /km2")}</strong>
                 <span>Density</span>
               </div>
@@ -533,6 +605,325 @@ function TerritoryFinder() {
           <div className="territory-empty">Loading territory profiles...</div>
         )}
       </article>
+    </section>
+  );
+}
+
+function VisualAtlas({ initialData }: { initialData: DashboardData }) {
+  const [rows, setRows] = useState<ThanaProfile[]>([]);
+  const [geo, setGeo] = useState<GeoResponse | null>(null);
+  const [metric, setMetric] = useState<AtlasMetric>("density");
+  const [activeKey, setActiveKey] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      fetch(staticDataUrl("thanas.json")).then((response) => response.json()) as Promise<ThanaResponse>,
+      fetch(staticDataUrl("geo/bangladesh-boundaries.json")).then((response) => response.json()) as Promise<GeoResponse>
+    ]).then(([profilePayload, geoPayload]) => {
+      if (cancelled) return;
+      setRows(profilePayload.rows);
+      setGeo(geoPayload);
+      setActiveKey(profilePayload.rows.find((row) => row.thana === "Badda" && row.district === "Dhaka")?.sourceKey ?? profilePayload.rows[0]?.sourceKey ?? "");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const profilesByName = useMemo(() => {
+    const map = new Map<string, ThanaProfile>();
+    rows.forEach((row) => {
+      const key = normalizeClientName(row.thana);
+      const current = map.get(key);
+      if (!current || toNumber(row.population) > toNumber(current.population)) {
+        map.set(key, row);
+      }
+    });
+    return map;
+  }, [rows]);
+
+  const topDenseThanas = useMemo(() => {
+    return [...rows]
+      .sort((a, b) => toNumber(b.densityPerSqKm) - toNumber(a.densityPerSqKm))
+      .slice(0, 20);
+  }, [rows]);
+
+  const maxDensity = topDenseThanas[0] ? toNumber(topDenseThanas[0].densityPerSqKm) : 1;
+  const activeProfile = rows.find((row) => row.sourceKey === activeKey) ?? topDenseThanas[0] ?? rows[0];
+  const marketCounts = useMemo(() => countProfiles(rows, "marketClassification"), [rows]);
+  const priorityCounts = useMemo(() => countProfiles(rows, "distributionPriority"), [rows]);
+  const sectorCounts = useMemo(() => countProfiles(rows, "primarySector"), [rows]);
+  const districtProfiles = useMemo(() => {
+    const districts = new Map<string, { district: string; division: string; count: number; population: number; priorityA: number; densityTotal: number }>();
+    rows.forEach((row) => {
+      const key = `${row.division}|${row.district}`;
+      const current = districts.get(key) ?? { district: row.district, division: row.division, count: 0, population: 0, priorityA: 0, densityTotal: 0 };
+      current.count += 1;
+      current.population += toNumber(row.population);
+      current.densityTotal += toNumber(row.densityPerSqKm);
+      if (row.distributionPriority === "A") current.priorityA += 1;
+      districts.set(key, current);
+    });
+    return [...districts.values()]
+      .map((row) => ({ ...row, avgDensity: row.count ? Math.round(row.densityTotal / row.count) : 0 }))
+      .sort((a, b) => b.priorityA - a.priorityA || b.population - a.population)
+      .slice(0, 12);
+  }, [rows]);
+
+  const mapContent = useMemo(() => {
+    const features = geo?.geojson.features ?? [];
+    if (!features.length) return null;
+    const width = 720;
+    const height = 620;
+    const project = buildProjection(features, width, height);
+
+    return (
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Analytical thana map" className="visual-map-svg">
+        {features.map((feature, index) => {
+          const name = String(feature.properties?.name ?? "");
+          const profile = profilesByName.get(normalizeClientName(name));
+          const selected = profile?.sourceKey === activeProfile?.sourceKey;
+          return (
+            <path
+              key={`${name}-${index}`}
+              d={geometryPath(feature.geometry, project)}
+              fill={atlasFill(profile, metric, maxDensity)}
+              className={selected ? "selected" : ""}
+              tabIndex={profile ? 0 : -1}
+              role={profile ? "button" : undefined}
+              aria-label={profile ? `${profile.thana}, ${profile.district}. ${profileLabel(profile, metric)}` : name}
+              onClick={() => {
+                if (profile) setActiveKey(profile.sourceKey);
+              }}
+              onKeyDown={(event) => {
+                if (profile && (event.key === "Enter" || event.key === " ")) {
+                  event.preventDefault();
+                  setActiveKey(profile.sourceKey);
+                }
+              }}
+            >
+              <title>{profile ? `${profile.thana}, ${profile.district}: ${profileLabel(profile, metric)}` : name}</title>
+            </path>
+          );
+        })}
+      </svg>
+    );
+  }, [activeProfile?.sourceKey, geo, maxDensity, metric, profilesByName]);
+
+  return (
+    <section className="section visual-atlas" id="visuals">
+      <div className="section-heading">
+        <div>
+          <span className="mono-label">Visual Atlas</span>
+          <h2>See density, markets, sectors, and distribution priority at once.</h2>
+          <p className="section-copy">
+            These views turn the source tables into decisions: where people cluster, which territories carry higher FMCG priority,
+            how urban and rural markets split, and which areas need careful source matching.
+          </p>
+        </div>
+        <div className="segmented light">
+          {atlasMetricOptions.map((option) => (
+            <button key={option.id} type="button" className={metric === option.id ? "active" : ""} onClick={() => setMetric(option.id)}>
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="visual-grid">
+        <article className="visual-map-card">
+          <div className="visual-card-heading">
+            <div>
+              <span>01 / Map</span>
+              <h3>{atlasMetricOptions.find((option) => option.id === metric)?.label} layer</h3>
+            </div>
+            <small>{formatNumber(geo?.geojson.features?.length ?? 0)} boundary features</small>
+          </div>
+          <div className={`visual-map metric-${metric}`}>
+            {mapContent ?? <div className="loading">Loading visual map...</div>}
+          </div>
+          <div className="map-legend">
+            {metric === "density" ? (
+              <>
+                <span><i className="density-low" /> Lower density</span>
+                <span><i className="density-mid" /> Mid density</span>
+                <span><i className="density-high" /> Highest density</span>
+              </>
+            ) : metric === "priority" ? (
+              <>
+                <span><i className="priority-a-dot" /> Priority A</span>
+                <span><i className="priority-b-dot" /> Priority B</span>
+                <span><i className="priority-c-dot" /> Priority C</span>
+              </>
+            ) : metric === "market" ? (
+              <>
+                <span><i className="urban-dot" /> Urban</span>
+                <span><i className="semi-dot" /> Semi-Urban</span>
+                <span><i className="rural-dot" /> Rural</span>
+              </>
+            ) : (
+              <>
+                <span><i className="agri-dot" /> Agriculture</span>
+                <span><i className="service-dot" /> Services</span>
+                <span><i className="industry-dot" /> Industry</span>
+              </>
+            )}
+          </div>
+        </article>
+
+        <article className="visual-profile-card">
+          <div className="visual-card-heading">
+            <div>
+              <span>02 / Click profile</span>
+              <h3>{activeProfile?.thana ?? "Loading profile"}</h3>
+            </div>
+            {activeProfile ? <small>{activeProfile.district}, {activeProfile.division}</small> : null}
+          </div>
+          {activeProfile ? (
+            <>
+              <div className="profile-stat-grid">
+                <div>
+                  <strong>{formatProfileNumber(activeProfile.population)}</strong>
+                  <span>People</span>
+                </div>
+                <div>
+                  <strong>{formatProfileNumber(activeProfile.densityPerSqKm, " /km2")}</strong>
+                  <span>Density</span>
+                </div>
+                <div>
+                  <strong>{activeProfile.distributionPriority || "n/a"}</strong>
+                  <span>Priority</span>
+                </div>
+              </div>
+              <div className="profile-lines">
+                <p><b>Market:</b> {activeProfile.marketClassification} · {activeProfile.fmcgTradeClass}</p>
+                <p><b>Sector:</b> {activeProfile.primarySector} · {activeProfile.subActivity}</p>
+                <p><b>Consumer:</b> {activeProfile.consumerProfile}</p>
+              </div>
+            </>
+          ) : (
+            <p className="section-copy">Loading profile data...</p>
+          )}
+        </article>
+
+        <article className="division-dashboard">
+          <div className="visual-card-heading">
+            <div>
+              <span>03 / Division comparison</span>
+              <h3>Population, area, density, and thana count</h3>
+            </div>
+            <BarChart3 size={22} />
+          </div>
+          <div className="division-table">
+            {initialData.divisions.map((division) => (
+              <div key={division.name}>
+                <strong>{division.name}</strong>
+                <span>{compactFormatter.format(division.population)}</span>
+                <span>{formatNumber(division.thanas)} thanas</span>
+                <span>{formatNumber(division.density)} /km2</span>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="dense-ranking">
+          <div className="visual-card-heading">
+            <div>
+              <span>04 / Top 20</span>
+              <h3>Most dense thanas</h3>
+            </div>
+            <TrendingUp size={22} />
+          </div>
+          <div className="dense-list">
+            {topDenseThanas.map((row, index) => (
+              <button key={row.sourceKey} type="button" onClick={() => setActiveKey(row.sourceKey)}>
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                <strong>{row.thana}</strong>
+                <small>{row.district}</small>
+                <b>{formatProfileNumber(row.densityPerSqKm, " /km2")}</b>
+              </button>
+            ))}
+          </div>
+        </article>
+
+        <article className="heatmap-panel">
+          <div className="visual-card-heading">
+            <div>
+              <span>05 / Market matrix</span>
+              <h3>Urban, semi-urban, and rural spread</h3>
+            </div>
+            <Layers3 size={22} />
+          </div>
+          <div className="heatmap-tiles">
+            {marketCounts.map((item) => (
+              <div key={item.name} className={`heat-tile market-${item.name.toLowerCase().replace(/[^a-z]+/g, "-")}`}>
+                <strong>{item.name}</strong>
+                <span>{item.count} thanas</span>
+                <i style={{ width: `${Math.max(8, item.pct)}%` }} />
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="heatmap-panel">
+          <div className="visual-card-heading">
+            <div>
+              <span>06 / FMCG heat</span>
+              <h3>Priority and sector mix</h3>
+            </div>
+            <Store size={22} />
+          </div>
+          <div className="priority-sector-grid">
+            <div>
+              {priorityCounts.map((item) => (
+                <span key={item.name} className={`priority-chip priority-${item.name.toLowerCase()}`}>Priority {item.name}: {item.count}</span>
+              ))}
+            </div>
+            <div>
+              {sectorCounts.map((item) => (
+                <span key={item.name}>{item.name}: {item.count}</span>
+              ))}
+            </div>
+          </div>
+        </article>
+
+        <article className="quality-panel">
+          <div className="visual-card-heading">
+            <div>
+              <span>07 / Source quality</span>
+              <h3>Coverage and mismatch controls</h3>
+            </div>
+            <ShieldCheck size={22} />
+          </div>
+          <div className="quality-grid">
+            <div><strong>Dataset-1 thana reference</strong><span>{initialData.dataQuality.sourceOfTruth}</span></div>
+            <div><strong>{formatNumber(initialData.dataQuality.geoFeaturesMatchedToDataset1)}</strong><span>Geo names matched to dataset-1</span></div>
+            <div><strong>{formatNumber(initialData.dataQuality.districtAliases + initialData.dataQuality.thanaAliases)}</strong><span>Name aliases applied</span></div>
+            <div><strong>{formatNumber(initialData.dataQuality.geoFeaturesMissingAdminIds)}</strong><span>Map features missing admin IDs</span></div>
+          </div>
+        </article>
+
+        <article className="district-priority-panel">
+          <div className="visual-card-heading">
+            <div>
+              <span>08 / District scan</span>
+              <h3>Where Priority A concentrates</h3>
+            </div>
+            <MapPin size={22} />
+          </div>
+          <div className="district-scan">
+            {districtProfiles.map((district) => (
+              <div key={`${district.division}-${district.district}`}>
+                <strong>{district.district}</strong>
+                <span>{district.division}</span>
+                <b>{district.priorityA} priority A</b>
+                <i style={{ width: `${Math.max(6, percentOf(district.priorityA, district.count))}%` }} />
+              </div>
+            ))}
+          </div>
+        </article>
+      </div>
     </section>
   );
 }
@@ -619,8 +1010,8 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
         <nav>
           <a href="#scale">Scale</a>
           <a href="#finder">Finder</a>
+          <a href="#visuals">Visuals</a>
           <a href="#divisions">Divisions</a>
-          <a href="#economy">Economy</a>
         </nav>
       </header>
 
@@ -629,12 +1020,12 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
           <span className="hero-kicker">Bangladesh · 2022</span>
           <h1>A portrait of a nation, <em>thana by thana.</em></h1>
           <p>
-            Every one of Bangladesh&apos;s 554 sub-districts, its people, its land,
-            the work it does, and how it shops, mapped into a single structured record.
-            This is the country at its most granular.
+            A searchable data atlas for Bangladesh: 554 thana and upazila profiles joined with
+            population, area, density, administrative hierarchy, market class, FMCG priority,
+            routes, bazars, and real boundary geometry.
           </p>
           <div className="hero-actions">
-            <a href="#scale">Explore the data</a>
+            <a href="#visuals">Open the visual atlas</a>
             <a href="#finder">Find a thana</a>
           </div>
         </div>
@@ -653,23 +1044,25 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
       <section className="source-strip" aria-label="Dataset source policy">
         <div>
           <span className="mono-label">Source rule</span>
-          <strong>Dataset-1 is authoritative for all thana/upazila records.</strong>
+          <strong>Dataset-1 remains the authority for every thana and upazila profile.</strong>
         </div>
         <p>
-          Dataset-2 supports geography: {formatNumber(initialData.totals.geoBoundaries)} map features,
-          {` ${formatNumber(initialData.totals.geoUpazilas)} `}geographic upazila names,
-          and {formatNumber(initialData.dataQuality.districtAliases + initialData.dataQuality.thanaAliases)} aliases for safer joins.
+          Dataset-2 adds the geography around it: {formatNumber(initialData.totals.geoBoundaries)} boundary features,
+          {` ${formatNumber(initialData.totals.bazars)} `}bazar points, {formatNumber(initialData.totals.routes)} route features,
+          and {formatNumber(initialData.dataQuality.districtAliases + initialData.dataQuality.thanaAliases)} name aliases that make the joins safer.
         </p>
       </section>
 
       <TerritoryFinder />
 
+      <VisualAtlas initialData={initialData} />
+
       <section className="section hierarchy">
         <span className="mono-label">Administrative Nesting</span>
-        <h2>How the country nests together</h2>
+        <h2>The record starts local, then rolls up cleanly.</h2>
         <p className="section-copy">
-          Bangladesh&apos;s administration runs four levels deep. The dataset records
-          the smallest of them, the thana, and rolls it up to the nation.
+          Each row begins at the thana or upazila level, then carries its district and division with it.
+          That lets the atlas answer local questions while still supporting national comparisons.
         </p>
         <div className="hierarchy-grid">
           <HierarchyCard level="Level 1" title="Country" detail="1 · Bangladesh" tone="red" />
@@ -683,10 +1076,10 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
         <div className="section-heading">
           <div>
             <span className="mono-label">The 8 divisions</span>
-            <h2>Dhaka holds a third of everyone</h2>
+            <h2>Population, density, and administrative load are uneven by design.</h2>
             <p className="dark-copy">
-              Population is heavily concentrated. The Dhaka division alone counts
-              35.3M people across 127 thanas.
+              Compare the same eight divisions by people, thana count, or density. Dhaka dominates population,
+              while smaller divisions reveal different service and distribution pressure.
             </p>
           </div>
           <div className="segmented">
@@ -709,10 +1102,10 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
       <section className="section economy" id="economy">
         <div>
           <span className="mono-label">What the land does</span>
-          <h2>An economy still rooted in the field</h2>
+          <h2>The economic profile explains why one route cannot serve every place.</h2>
           <p className="section-copy">
-            Seven in ten thanas are primarily agricultural, and traditional retail
-            dominates almost everywhere. Modern trade is still a rounding error.
+            The dataset separates primary livelihood, market classification, and FMCG trade channel.
+            Together, they show where agriculture-heavy territories, industrial pockets, and service-led urban markets need different coverage plans.
           </p>
         </div>
         <div className="economy-stack">
@@ -735,10 +1128,10 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
         <div className="section-heading">
           <div>
             <span className="mono-label">Who buys, and where</span>
-            <h2>A distribution map for 554 territories</h2>
+            <h2>Consumer profiles turn geography into route-to-market signals.</h2>
             <p className="section-copy">
-              Each thana carries a consumer profile and a distribution priority,
-              a ready-made route-to-market guide for the country.
+              Every territory has a consumer segment, likely FMCG categories, and an A/B/C priority.
+              Use it to separate premium urban demand, general trade reach, and rural replenishment patterns.
             </p>
           </div>
         </div>
@@ -770,7 +1163,10 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
         <div className="section-heading">
           <div>
             <span className="mono-label">Full Data Atlas</span>
-            <h2>Boundaries, routes, and market points in one viewer.</h2>
+            <h2>The raw geography is still available for inspection.</h2>
+            <p className="dark-copy">
+              Switch between boundary polygons, bazar points, and route lines when you need to inspect the source geometry directly.
+            </p>
           </div>
           <div className="segmented">
             {layerOptions.map((layer) => (
@@ -792,7 +1188,7 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
         <div className="section-heading">
           <div>
             <span className="mono-label">All Bangladesh Data</span>
-            <h2>Every source, plus the normalized thana table.</h2>
+            <h2>Every source file is indexed, searchable, and ready to inspect.</h2>
           </div>
           <Database size={34} />
         </div>
@@ -820,7 +1216,7 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
         <div className="section-heading">
           <div>
             <span className="mono-label">Raw Explorer</span>
-            <h2>Search and export any dataset.</h2>
+            <h2>Search the underlying rows, then export what you need.</h2>
           </div>
           <div className="dataset-select">
             <Table2 size={17} />
@@ -840,7 +1236,7 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
           <strong>Portrait of Bangladesh</strong>
         </div>
         <p>
-          Built as a full Next.js application from `dataset-1`, `dataset-2`, and the imported Claude Design reference.
+          Built as a static Next.js atlas from dataset-1, dataset-2, and the imported Claude Design reference.
         </p>
         <span><Activity size={14} /> {initialData.datasets.length} datasets indexed · <Waypoints size={14} /> {formatNumber(initialData.totals.routes)} route features</span>
       </footer>
