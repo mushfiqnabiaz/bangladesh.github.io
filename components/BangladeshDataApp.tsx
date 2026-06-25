@@ -4,10 +4,14 @@ import { useDeferredValue, useEffect, useMemo, useState, useTransition } from "r
 import {
   Activity,
   ArrowDownToLine,
+  BadgeCheck,
   Database,
   Map,
+  MapPin,
   Search,
+  Store,
   Table2,
+  UsersRound,
   Waypoints
 } from "lucide-react";
 import type { DashboardData, DataRow, DatasetDefinition } from "@/lib/data";
@@ -34,6 +38,29 @@ type GeoResponse = {
   };
 };
 
+type ThanaProfile = {
+  division: string;
+  district: string;
+  thana: string;
+  thanaType: string;
+  population: string;
+  areaSqKm: string;
+  densityPerSqKm: string;
+  primarySector: string;
+  subActivity: string;
+  marketClassification: string;
+  fmcgTradeClass: string;
+  consumerProfile: string;
+  likelyTopFmcgCategories: string;
+  distributionPriority: string;
+  sourceKey: string;
+};
+
+type ThanaResponse = {
+  sourceOfTruth: string;
+  rows: ThanaProfile[];
+};
+
 const formatter = new Intl.NumberFormat("en-US");
 const compactFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
@@ -56,10 +83,22 @@ function formatNumber(value: number) {
   return formatter.format(Math.round(value));
 }
 
+function toNumber(value: unknown) {
+  if (typeof value === "number") return value;
+  if (typeof value !== "string") return 0;
+  const parsed = Number(value.replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function csvEscape(value: unknown) {
   const text = String(value ?? "");
   if (!/[",\n]/.test(text)) return text;
   return `"${text.replaceAll('"', '""')}"`;
+}
+
+function formatProfileNumber(value: unknown, suffix = "") {
+  const number = toNumber(value);
+  return number ? `${formatNumber(number)}${suffix}` : "n/a";
 }
 
 function downloadRows(dataset: DatasetDefinition | null, rows: DataRow[]) {
@@ -370,6 +409,134 @@ function HeroBangladeshMap() {
   );
 }
 
+function TerritoryFinder() {
+  const [rows, setRows] = useState<ThanaProfile[]>([]);
+  const [query, setQuery] = useState("Dhaka");
+  const [selectedKey, setSelectedKey] = useState("");
+  const deferredQuery = useDeferredValue(query.trim().toLowerCase());
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(staticDataUrl("thanas.json"))
+      .then((response) => response.json())
+      .then((payload: ThanaResponse) => {
+        if (cancelled) return;
+        setRows(payload.rows);
+        setSelectedKey(payload.rows.find((row) => row.thana === "Adabor" && row.district === "Dhaka")?.sourceKey ?? payload.rows[0]?.sourceKey ?? "");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const matches = useMemo(() => {
+    if (!rows.length) return [];
+    const needle = deferredQuery;
+    const candidates = needle
+      ? rows.filter((row) => [row.thana, row.district, row.division, row.consumerProfile, row.primarySector]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle))
+      : rows;
+    return candidates.slice(0, 7);
+  }, [deferredQuery, rows]);
+
+  const selected = rows.find((row) => row.sourceKey === selectedKey);
+  const activeProfile = matches[0] ?? selected ?? rows[0];
+  const totalMatches = deferredQuery ? rows.filter((row) => [row.thana, row.district, row.division, row.consumerProfile, row.primarySector]
+    .join(" ")
+    .toLowerCase()
+    .includes(deferredQuery)).length : rows.length;
+
+  return (
+    <section className="territory-finder" id="finder" aria-label="Territory finder">
+      <div className="finder-copy">
+        <span className="mono-label">Territory finder</span>
+        <h2>Search any thana and read its market profile.</h2>
+        <label className="finder-search">
+          <Search size={18} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search thana, district, sector, or profile"
+          />
+        </label>
+        <div className="finder-results" aria-label="Matching territories">
+          {matches.map((row) => (
+            <button
+              key={row.sourceKey}
+              type="button"
+              className={row.sourceKey === activeProfile?.sourceKey ? "active" : ""}
+              onClick={() => {
+                setQuery(`${row.thana}, ${row.district}`);
+                setSelectedKey(row.sourceKey);
+              }}
+            >
+              <strong>{row.thana}</strong>
+              <span>{row.district} · {row.division}</span>
+            </button>
+          ))}
+        </div>
+        <small>{formatNumber(totalMatches)} matching territories · dataset-1 source</small>
+      </div>
+
+      <article className="territory-card">
+        {activeProfile ? (
+          <>
+            <div className="territory-card-title">
+              <span><MapPin size={15} /> {activeProfile.district} / {activeProfile.division}</span>
+              <b className={`priority-badge priority-${activeProfile.distributionPriority.toLowerCase()}`}>
+                Priority {activeProfile.distributionPriority}
+              </b>
+            </div>
+            <h3>{activeProfile.thana}</h3>
+            <div className="territory-metrics">
+              <div>
+                <UsersRound size={18} />
+                <strong>{formatProfileNumber(activeProfile.population)}</strong>
+                <span>Population</span>
+              </div>
+              <div>
+                <Map size={18} />
+                <strong>{formatProfileNumber(activeProfile.densityPerSqKm, " /km2")}</strong>
+                <span>Density</span>
+              </div>
+              <div>
+                <BadgeCheck size={18} />
+                <strong>{activeProfile.thanaType}</strong>
+                <span>Admin type</span>
+              </div>
+            </div>
+            <div className="territory-profile-grid">
+              <div>
+                <span>Primary sector</span>
+                <strong>{activeProfile.primarySector}</strong>
+                <small>{activeProfile.subActivity}</small>
+              </div>
+              <div>
+                <span>Market class</span>
+                <strong>{activeProfile.marketClassification}</strong>
+                <small>{activeProfile.fmcgTradeClass}</small>
+              </div>
+              <div>
+                <span>Consumer profile</span>
+                <strong>{activeProfile.consumerProfile}</strong>
+                <small>{activeProfile.likelyTopFmcgCategories}</small>
+              </div>
+            </div>
+            <div className="territory-route">
+              <Store size={18} />
+              <span>{activeProfile.marketClassification} route · {activeProfile.fmcgTradeClass}</span>
+            </div>
+          </>
+        ) : (
+          <div className="territory-empty">Loading territory profiles...</div>
+        )}
+      </article>
+    </section>
+  );
+}
+
 function DataTable({ selectedDataset }: { selectedDataset: string }) {
   const [payload, setPayload] = useState<DatasetResponse | null>(null);
   const [query, setQuery] = useState("");
@@ -451,9 +618,9 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
         </a>
         <nav>
           <a href="#scale">Scale</a>
+          <a href="#finder">Finder</a>
           <a href="#divisions">Divisions</a>
           <a href="#economy">Economy</a>
-          <a href="#fmcg">Consumers</a>
         </nav>
       </header>
 
@@ -468,7 +635,7 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
           </p>
           <div className="hero-actions">
             <a href="#scale">Explore the data</a>
-            <a href="#fmcg">FMCG profile</a>
+            <a href="#finder">Find a thana</a>
           </div>
         </div>
         <div className="map-card">
@@ -494,6 +661,8 @@ export function BangladeshDataApp({ initialData }: { initialData: DashboardData 
           and {formatNumber(initialData.dataQuality.districtAliases + initialData.dataQuality.thanaAliases)} aliases for safer joins.
         </p>
       </section>
+
+      <TerritoryFinder />
 
       <section className="section hierarchy">
         <span className="mono-label">Administrative Nesting</span>
